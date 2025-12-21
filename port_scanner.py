@@ -1,3 +1,16 @@
+# port_scanner.py
+# By Matthew Wilson
+# 12/20/25
+# This program is for educational purposes only. 
+# Topics: TCP/UDP, Sockets, Timeouts, Error Handling, Firewalls, Multithreading, Service/Banner Detection, CIDR range scanning.
+# TODO:
+#	- Rewrite in Go
+#	- Use argparse for CLI args
+#	- Add port ranges
+#	- Output formatting
+#	- Verbose mode
+# Example Usage Goal: python3 port_scanner.py -t 192.168.1.1 -p 1-1024 --threads 200
+
 import socket
 # Imports Python's low-level networking module.
 # This lets us create TCP sockets, resolve hostnames, and connect to ports.
@@ -40,8 +53,17 @@ def scan_port(ip, port):
 			# Attempts to connect to the IP and port.
 			# connect_ex() returns 0 on success, non-zero on failure.
 			if s.connect_ex((ip, port)) == 0:
-				# If the port is open, return the port number.
-				return port
+				try:
+					# Try to receive up to 1024 bytes (banner grabbing)
+					banner = s.recv(1024)
+
+					# Decode sefely (some services send binary junk)
+					banner = banner.decode(errors="ignore").strip()
+					
+					return port, banner if banner else None
+				except socket.timeout:
+					# If the port is open, but didn't send data
+					return port, None
 
 			# If the port is closed, return None.
 			return None
@@ -50,7 +72,7 @@ def scan_port(ip, port):
 		# Catches lower-level socket errors (network issues, resets, etc.).
 		print(f"[!] Socket error on port {port}: {e}")
 		# Returns False of indicate the scan failedfor this port.
-		return False
+		return None
 
 def main():
 	# Main function - this is where program execution starts.
@@ -76,11 +98,14 @@ def main():
 			for future in as_completed(futures):
 
 				# Retrieves the return value from scan_port().
-				port = future.result()
+				result = future.result()
 
 				# If a port number was returned, the port is open.
-				if port:
+				if result:
+					port, banner = result
 					print(f"[+] Port {port} open")
+					if banner:
+						print(f"	Banner: {banner}")
 
 	except KeyboardInterrupt:
 		# Catches Ctrl+C so the program exits cleanly.
