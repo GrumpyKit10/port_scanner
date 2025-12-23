@@ -9,7 +9,6 @@
 #	- Add port ranges
 #	- Output formatting
 #	- Verbose mode
-#   - Make all args optional
 # Example Usage Goal: python3 port_scanner.py -t 192.168.1.1 -p 1-1024 --threads 200
 
 import socket
@@ -24,13 +23,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Imports tools for running functions concurrently (multi-threading).
 # ThreadPoolExecutor manages worker threads.
 # as_completed lets us process results at threads finish.
-
-import argparse
-
-parser = argparse.ArgumentParser()
-parser.add_argument("-t", "--target", help="Target IP or Hostname to be scanned", required=True)
-args = vars(parser.parse_args())
-
 
 def resolve_host(hostname):
 	# Defines a function that converts a hostname (e.g., scanme.nmap.org)
@@ -85,8 +77,7 @@ def scan_port(ip, port):
 def main():
 	# Main function - this is where program execution starts.
 
-	hostname = args["target"]
-    # hostname = "scanme.nmap.org"
+	hostname = "scanme.nmap.org"
 	# Defines the target hostname to scan.
 
 	ip = resolve_host(hostname)
