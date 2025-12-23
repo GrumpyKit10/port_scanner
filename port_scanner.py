@@ -4,13 +4,22 @@
 # This program is for educational purposes only. 
 # Topics: TCP/UDP, Sockets, Timeouts, Error Handling, Firewalls, Multithreading, Service/Banner Detection, CIDR range scanning.
 # TODO:
-#	- Rewrite in Go
-#	- Use argparse for CLI args
-#	- Add port ranges
-#	- Output formatting
-#	- Verbose mode
+#   - Rewrite in Go
+#   - Use argparse for CLI args - DONE
+#   - Add port ranges - DONE
+#   - Output formatting
+#   - Verbose mode
 #   - Make all args optional
+#   - Expand port arg to scan common groups of ports (all, common, etc)
+#   - Better arg help message (add usage)
 # Example Usage Goal: python3 port_scanner.py -t 192.168.1.1 -p 1-1024 --threads 200
+#
+# Issues: False-positive open ports
+#           Fix:    - Treat only SYN-ACK as open
+#                   - Treat RST as closed
+#                   - Treat timeout as filtered
+#                   - Distinguish TCP vs UDP
+#                   - Never label a port open without a confirmed listener
 
 import socket
 # Imports Python's low-level networking module.
@@ -28,104 +37,113 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("-t", "--target", help="Target IP or Hostname to be scanned", required=True)
+parser.add_argument("-t", "--target", help="target ip or hostname to be scanned", required=True)
+parser.add_argument("-p", "--ports", help="port(s) to be scanned on target", required=True)
 args = vars(parser.parse_args())
 
+def parse_ports(port_arg):
+    if "-" in port_arg:
+        start, end = port_arg.split("-")
+        return range(int(start), int(end) +1)
+    else:
+        return [int(port_arg)]
 
 def resolve_host(hostname):
-	# Defines a function that converts a hostname (e.g., scanme.nmap.org)
-	# into an IP address.
+    # Defines a function that converts a hostname (e.g., scanme.nmap.org)
+    # into an IP address.
 
-	try:
-		# Attempt to resolve the hostname using DNS
-		return socket.gethostbyname(hostname)
-	except socket.gaierror as e:
-		# Catches DNS-related errors (e.g., invalid hostnames, DNS failure).
-		print(f"[!] Hostname resolution failed for {hostname}: {e}")
-		# Prints an error message explaining what went wrong.
-		sys.exit(1)
-		# Exits the program with a non-zero exit code (indicates failure).
+    try:
+        # Attempt to resolve the hostname using DNS
+        return socket.gethostbyname(hostname)
+    except socket.gaierror as e:
+        # Catches DNS-related errors (e.g., invalid hostnames, DNS failure).
+        print(f"[!] Hostname resolution failed for {hostname}: {e}")
+        # Prints an error message explaining what went wrong.
+        sys.exit(1)
+        # Exits the program with a non-zero exit code (indicates failure).
 
 def scan_port(ip, port):
-	# Defines a function that checks whether a specific TCP port is open
-	# on a given IP address.
+    # Defines a function that checks whether a specific TCP port is open
+    # on a given IP address.
 
-	try:
-		# Creates a TCP socket using IPv4 (AF_INET) and TCP (SOCK_STREAM).
-		# The 'with' statement ensures the socket is closed automatically.
-		with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    try:
+        # Creates a TCP socket using IPv4 (AF_INET) and TCP (SOCK_STREAM).
+        # The 'with' statement ensures the socket is closed automatically.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
 
-			#Sets a timeout of 1 second so we don't hang on slow ports.
-			s.settimeout(1)
+            #Sets a timeout of 1 second so we don't hang on slow ports.
+            s.settimeout(1)
 
-			# Attempts to connect to the IP and port.
-			# connect_ex() returns 0 on success, non-zero on failure.
-			if s.connect_ex((ip, port)) == 0:
-				try:
-					# Try to receive up to 1024 bytes (banner grabbing)
-					banner = s.recv(1024)
+            # Attempts to connect to the IP and port.
+            # connect_ex() returns 0 on success, non-zero on failure.
+            if s.connect_ex((ip, port)) == 0:
+                try:
+                    # Try to receive up to 1024 bytes (banner grabbing)
+                    banner = s.recv(1024)
 
-					# Decode sefely (some services send binary junk)
-					banner = banner.decode(errors="ignore").strip()
-					
-					return port, banner if banner else None
-				except socket.timeout:
-					# If the port is open, but didn't send data
-					return port, None
+                    # Decode sefely (some services send binary junk)
+                    banner = banner.decode(errors="ignore").strip()
+                    
+                    return port, banner if banner else None
+                except socket.timeout:
+                    # If the port is open, but didn't send data
+                    return port, None
 
-			# If the port is closed, return None.
-			return None
+            # If the port is closed, return None.
+            return None
 
-	except socket.error as e:
-		# Catches lower-level socket errors (network issues, resets, etc.).
-		print(f"[!] Socket error on port {port}: {e}")
-		# Returns False of indicate the scan failedfor this port.
-		return None
+    except socket.error as e:
+        # Catches lower-level socket errors (network issues, resets, etc.).
+        print(f"[!] Socket error on port {port}: {e}")
+        # Returns False of indicate the scan failedfor this port.
+        return None
 
 def main():
-	# Main function - this is where program execution starts.
+    # Main function - this is where program execution starts.
 
-	hostname = args["target"]
+    hostname = args["target"]
     # hostname = "scanme.nmap.org"
-	# Defines the target hostname to scan.
+    # Defines the target hostname to scan.
 
-	ip = resolve_host(hostname)
-	# Resolves the hostname into an IP address.
+    R = parse_ports(args["ports"])
 
-	print(f"[*] Scanning {hostname} ({ip})")
-	# Prints status information so the user knows what's being scanned.
+    ip = resolve_host(hostname)
+    # Resolves the hostname into an IP address.
 
-	try:
-		# Creates a pool of up to 100 worker threads.
-		with ThreadPoolExecutor(max_workers=100) as executor:
+    print(f"[*] Scanning {hostname} ({ip})")
+    # Prints status information so the user knows what's being scanned.
 
-			# Submits scan_port() tasks to the thread pool for ports 1-1024.
-			# Each call runs in a separate thread.
-			futures = [executor.submit(scan_port, ip, port) for port in range(1, 1025)]
-			
-			# Iterates over futures as they finish (not in order).
-			for future in as_completed(futures):
+    try:
+        # Creates a pool of up to 100 worker threads.
+        with ThreadPoolExecutor(max_workers=100) as executor:
+            
+            # Submits scan_port() tasks to the thread pool for ports 1-1024.
+            # Each call runs in a separate thread.
+            futures = [executor.submit(scan_port, ip, port) for port in R] # range(1, 1025)]
+            
+            # Iterates over futures as they finish (not in order).
+            for future in as_completed(futures):
 
-				# Retrieves the return value from scan_port().
-				result = future.result()
+                # Retrieves the return value from scan_port().
+                result = future.result()
 
-				# If a port number was returned, the port is open.
-				if result:
-					port, banner = result
-					print(f"[+] Port {port} open")
-					if banner:
-						print(f"	Banner: {banner}")
+                # If a port number was returned, the port is open.
+                if result:
+                    port, banner = result
+                    print(f"[+] Port {port} open")
+                    if banner:
+                        print(f"    Banner: {banner}")
 
-	except KeyboardInterrupt:
-		# Catches Ctrl+C so the program exits cleanly.
-		print("\n[!] Scan interrupted by user. Exiting.")
-		sys.exit(0)
-		# Exits normally (exit code 0)
+    except KeyboardInterrupt:
+        # Catches Ctrl+C so the program exits cleanly.
+        print("\n[!] Scan interrupted by user. Exiting.")
+        sys.exit(0)
+        # Exits normally (exit code 0)
 
-	print("[*] Scan complete.")
-	# Indicates the scan finished successfully.
+    print("[*] Scan complete.")
+    # Indicates the scan finished successfully.
 
 if __name__ == "__main__":
-	# ensures main() only runs when the script is executed directly.
-	# not when imported as a module. 
-	main()
+    # ensures main() only runs when the script is executed directly.
+    # not when imported as a module. 
+    main()
