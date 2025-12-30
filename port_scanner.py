@@ -5,13 +5,21 @@
 # Topics: TCP/UDP, Sockets, Timeouts, Error Handling, Firewalls, Multithreading, Service/Banner Detection, CIDR range scanning.
 # TODO:
 #   - Rewrite in Go
-#   - Use argparse for CLI args - DONE
-#   - Add port ranges - DONE
-#   - Output formatting
-#   - Verbose mode
+#   - Use argparse for CLI args - DONE (12/20/25)
+#   - Add port ranges - DONE (12/20/25)
+#   - Output formatting / Output modes (quiet, grepable, JSON) - DONE (12/30/25)
 #   - Make all args optional
 #   - Expand port arg to scan common groups of ports (all, common, etc)
 #   - Better arg help message (add usage)
+#   - Async / adaptive delays / batching
+#   - Service detection
+#   - SYN rate limiting / token bucket rate limiting
+#   - Proper banners
+#       - 2nd stage connect scan on open ports, or
+#       - protocol specific probes (HTTP, SMTP, etc.)
+#   - ICMP filtered handling
+#   - CIDR expansion / progress reporting
+#
 # Example Usage Goal: python3 port_scanner.py -t 192.168.1.1 -p 1-1024 --threads 200
 #
 # Issues: False-positive open ports
@@ -39,7 +47,18 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("-t", "--target", help="target ip or hostname to be scanned", required=True)
 parser.add_argument("-p", "--ports", help="port(s) to be scanned on target", required=True)
-args = vars(parser.parse_args())
+parser.add_argument(
+    "-v", "--verbose", 
+    type=int, 
+    default=1, 
+    help="Verbosity level: 0=quiet, 1=normal, 2=debug", 
+    required=False
+)
+cli = vars(parser.parse_args())
+
+def vprint(level, *args, **kwargs):
+        if cli["verbose"] >= level:
+            print(*args, **kwargs)
 
 def parse_ports(port_arg):
     if "-" in port_arg:
@@ -57,7 +76,7 @@ def resolve_host(hostname):
         return socket.gethostbyname(hostname)
     except socket.gaierror as e:
         # Catches DNS-related errors (e.g., invalid hostnames, DNS failure).
-        print(f"[!] Hostname resolution failed for {hostname}: {e}")
+        vprint(1, f"[!] Hostname resolution failed for {hostname}: {e}")
         # Prints an error message explaining what went wrong.
         sys.exit(1)
         # Exits the program with a non-zero exit code (indicates failure).
@@ -94,28 +113,28 @@ def scan_port(ip, port):
 
     except socket.error as e:
         # Catches lower-level socket errors (network issues, resets, etc.).
-        print(f"[!] Socket error on port {port}: {e}")
+        vprint(1, f"[!] Socket error on port {port}: {e}")
         # Returns False of indicate the scan failedfor this port.
         return None
 
 def main():
     # Main function - this is where program execution starts.
 
-    hostname = args["target"]
+    hostname = cli["target"]
     # hostname = "scanme.nmap.org"
     # Defines the target hostname to scan.
 
-    R = parse_ports(args["ports"])
+    R = parse_ports(cli["ports"])
 
     ip = resolve_host(hostname)
     # Resolves the hostname into an IP address.
 
-    print(f"[*] Scanning {hostname} ({ip})")
+    vprint(1, f"[*] Scanning {hostname} ({ip})")
     # Prints status information so the user knows what's being scanned.
 
     try:
-        # Creates a pool of up to 100 worker threads.
-        with ThreadPoolExecutor(max_workers=100) as executor:
+        # Creates a pool of up to 30 worker threads.
+        with ThreadPoolExecutor(max_workers=30) as executor:
             
             # Submits scan_port() tasks to the thread pool for ports 1-1024.
             # Each call runs in a separate thread.
@@ -130,17 +149,17 @@ def main():
                 # If a port number was returned, the port is open.
                 if result:
                     port, banner = result
-                    print(f"[+] Port {port} open")
+                    vprint(0, f"[+] Port {port} open")
                     if banner:
-                        print(f"    Banner: {banner}")
+                        vprint(1, f"    Banner: {banner}")
 
     except KeyboardInterrupt:
         # Catches Ctrl+C so the program exits cleanly.
-        print("\n[!] Scan interrupted by user. Exiting.")
+        vprint(1, "\n[!] Scan interrupted by user. Exiting.")
         sys.exit(0)
         # Exits normally (exit code 0)
 
-    print("[*] Scan complete.")
+    vprint(1, "[*] Scan complete.")
     # Indicates the scan finished successfully.
 
 if __name__ == "__main__":
