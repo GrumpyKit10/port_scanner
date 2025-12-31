@@ -7,40 +7,30 @@
 #   - Rewrite in Go
 #   - Use argparse for CLI args - DONE (12/20/25)
 #   - Add port ranges - DONE (12/20/25)
-#   - Output formatting / Output modes (quiet, grepable, JSON) - DONE (12/30/25)
+#   - Output formatting / Output modes (quiet - DONE (12/30/25), grepable, JSON, full packet - DONE (12/30/25)) 
 #   - Make all args optional
 #   - Expand port arg to scan common groups of ports (all, common, etc)
 #   - Better arg help message (add usage)
-#   - Async / adaptive delays / batching
-#   - Service detection
-#   - SYN rate limiting / token bucket rate limiting
-#   - Proper banners
-#       - 2nd stage connect scan on open ports, or
-#       - protocol specific probes (HTTP, SMTP, etc.)
-#   - ICMP filtered handling
+#   - Batching - DONE (12/30/25)
+#   - Use socket for banners with scapy - DONE (12/30/25)
+#   - ICMP filtered handling - DONE (12/30/25)
 #   - CIDR expansion / progress reporting
+#   - Use Scapy for SYN mode and full packet output - DONE (12/30/25)
+#   - Threading for banners?
 #
-# Example Usage Goal: python3 port_scanner.py -t 192.168.1.1 -p 1-1024 --threads 200
+# Example Usage Goal: sudo python3 port_scanner.py -t scanme.nmap.org -p 1-1024 -v 2 -b 200
 #
-# Issues: False-positive open ports
-#           Fix:    - Treat only SYN-ACK as open
-#                   - Treat RST as closed
-#                   - Treat timeout as filtered
-#                   - Distinguish TCP vs UDP
-#                   - Never label a port open without a confirmed listener
+# Issues: 
+
+from scapy.all import IP, TCP, sr, sr1, hexdump
+
+from scapy.layers.inet import ICMP
 
 import socket
-# Imports Python's low-level networking module.
-# This lets us create TCP sockets, resolve hostnames, and connect to ports.
 
 import sys
 # Imports system-specific functions.
 # We use this mainly for sys.exit() to cleanly terminate the program.
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-# Imports tools for running functions concurrently (multi-threading).
-# ThreadPoolExecutor manages worker threads.
-# as_completed lets us process results at threads finish.
 
 import argparse
 
@@ -51,7 +41,14 @@ parser.add_argument(
     "-v", "--verbose", 
     type=int, 
     default=1, 
-    help="Verbosity level: 0=quiet, 1=normal, 2=debug", 
+    help="Verbosity level: 0=quiet, 1=normal, 2=more info 4=full packet", 
+    required=False
+)
+parser.add_argument(
+    "-b", "--batch", 
+    type=int, 
+    default=100, 
+    help="batch size for port scans", 
     required=False
 )
 cli = vars(parser.parse_args())
@@ -61,103 +58,128 @@ def vprint(level, *args, **kwargs):
             print(*args, **kwargs)
 
 def parse_ports(port_arg):
-    if "-" in port_arg:
-        start, end = port_arg.split("-")
-        return range(int(start), int(end) +1)
-    else:
-        return [int(port_arg)]
-
-def resolve_host(hostname):
-    # Defines a function that converts a hostname (e.g., scanme.nmap.org)
-    # into an IP address.
-
     try:
-        # Attempt to resolve the hostname using DNS
-        return socket.gethostbyname(hostname)
-    except socket.gaierror as e:
-        # Catches DNS-related errors (e.g., invalid hostnames, DNS failure).
-        vprint(1, f"[!] Hostname resolution failed for {hostname}: {e}")
-        # Prints an error message explaining what went wrong.
-        sys.exit(1)
-        # Exits the program with a non-zero exit code (indicates failure).
+        if "-" in port_arg:
+            start, end = port_arg.split("-", 1)
+            start, end = int(start), int(end)
+        
+            if not (1 <= start <= 65535 and 1 <= end <= 65535):
+                raise ValueError
+                
+            if start > end:
+                raise ValueError("Start port greater then end port")
+            
+            return range(start, end + 1)
+        else:
+            port = int(port_arg)
+            if not (1 <= port <= 65535):
+                raise ValueError
+            return [port]
+    
+    except ValueError:
+        vprint(2,"[!] Invalid port specification.")
+        sys.exit(2)
+    
+def scan_ports_batched(ip, ports, batch_size):
+    results = {}
 
-def scan_port(ip, port):
-    # Defines a function that checks whether a specific TCP port is open
-    # on a given IP address.
+    ports = list(ports)
 
+    for i in range(0, len(ports), batch_size):
+        batch = ports[i:i + batch_size]
+
+        vprint(2, f"[*] Scanning ports {batch[0]}-{batch[-1]}")
+
+        packets = IP(dst=ip) / TCP(dport=batch, flags="S")
+        answered, unanswered = sr(packets, timeout=1, verbose=False)
+
+        # Handle answered packets
+        for sent, recv in answered:
+            port = sent[TCP].dport
+
+            if recv.haslayer(ICMP):
+                icmp = recv[ICMP]
+                if icmp.type == 3:
+                    results[port] = ("filtered", recv)
+                    continue
+
+            if not recv.haslayer(TCP):
+                results[port] = ("unknown", recv)
+                continue
+
+            tcp = recv[TCP]
+
+            if tcp.flags == 0x12:  # SYN-ACK
+                # Send RST to cleanly close
+                rst = IP(dst=ip)/TCP(dport=port, flags="R")
+                sr1(rst, timeout=0.3, verbose=False)
+                results[port] = ("open", recv)
+
+            elif tcp.flags == 0x14:  # RST-ACK
+                results[port] = ("closed", recv)
+
+            else:
+                results[port] = ("unknown", recv)
+
+        # Handle unanswered packets
+        for pkt in unanswered:
+            port = pkt[TCP].dport
+            results[port] = ("filtered", None)
+
+    return results
+
+def print_packet(packet):
+    if cli["verbose"] >= 4 and packet:
+        print(packet.summary())
+        hexdump(packet)
+    
+def banner_grab(ip, port):
     try:
-        # Creates a TCP socket using IPv4 (AF_INET) and TCP (SOCK_STREAM).
-        # The 'with' statement ensures the socket is closed automatically.
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-
-            #Sets a timeout of 1 second so we don't hang on slow ports.
-            s.settimeout(1)
-
-            # Attempts to connect to the IP and port.
-            # connect_ex() returns 0 on success, non-zero on failure.
-            if s.connect_ex((ip, port)) == 0:
-                try:
-                    # Try to receive up to 1024 bytes (banner grabbing)
-                    banner = s.recv(1024)
-
-                    # Decode sefely (some services send binary junk)
-                    banner = banner.decode(errors="ignore").strip()
-                    
-                    return port, banner if banner else None
-                except socket.timeout:
-                    # If the port is open, but didn't send data
-                    return port, None
-
-            # If the port is closed, return None.
-            return None
-
-    except socket.error as e:
-        # Catches lower-level socket errors (network issues, resets, etc.).
-        vprint(1, f"[!] Socket error on port {port}: {e}")
-        # Returns False of indicate the scan failedfor this port.
+        with socket.create_connection((ip, port), timeout=2) as s:
+            banner = s.recv(1024)
+            return banner.decode(errors="ignore").strip()
+    except (socket.timeout, ConnectionRefusedError):
+        return None
+    except Exception as e:
+        vprint(2, f"[!] Banner error on {port}: {e}")
         return None
 
-def main():
-    # Main function - this is where program execution starts.
-
-    hostname = cli["target"]
-    # hostname = "scanme.nmap.org"
-    # Defines the target hostname to scan.
-
-    R = parse_ports(cli["ports"])
-
-    ip = resolve_host(hostname)
-    # Resolves the hostname into an IP address.
-
-    vprint(1, f"[*] Scanning {hostname} ({ip})")
-    # Prints status information so the user knows what's being scanned.
-
+def resolve_target(target):
     try:
-        # Creates a pool of up to 30 worker threads.
-        with ThreadPoolExecutor(max_workers=30) as executor:
-            
-            # Submits scan_port() tasks to the thread pool for ports 1-1024.
-            # Each call runs in a separate thread.
-            futures = [executor.submit(scan_port, ip, port) for port in R] # range(1, 1025)]
-            
-            # Iterates over futures as they finish (not in order).
-            for future in as_completed(futures):
+        return socket.gethostbyname(target)
+    except socket.gaierror:
+        vprint(2, f"[!] Unable to resolve target: {target}")
+        sys.exit(2)
 
-                # Retrieves the return value from scan_port().
-                result = future.result()
+def main():
+    try: 
+        ip = resolve_target(cli["target"])
+        
+        ports = parse_ports(cli["ports"])
+    
+        results = scan_ports_batched(ip, ports, cli["batch"])
 
-                # If a port number was returned, the port is open.
-                if result:
-                    port, banner = result
-                    vprint(0, f"[+] Port {port} open")
-                    if banner:
-                        vprint(1, f"    Banner: {banner}")
+        for port in sorted(results):
+            state, packet = results[port]
+
+            if state == "open":
+                vprint(0, f"[+] Port {port} open")
+
+                banner = banner_grab(ip, port)
+                if banner:
+                    vprint(1, f"    Banner: {banner}")
+
+                print_packet(packet)
 
     except KeyboardInterrupt:
         # Catches Ctrl+C so the program exits cleanly.
-        vprint(1, "\n[!] Scan interrupted by user. Exiting.")
+        vprint(2, "\n[!] Scan interrupted by user. Exiting.")
         sys.exit(0)
         # Exits normally (exit code 0)
+    
+    except Exception as e:
+        vprint(2, f"[!] Fatal error: {e}")
+        sys.exit(1)
 
     vprint(1, "[*] Scan complete.")
     # Indicates the scan finished successfully.
