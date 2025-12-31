@@ -7,8 +7,8 @@
 #   - Rewrite in Go
 #   - Use argparse for CLI args - DONE (12/20/25)
 #   - Add port ranges - DONE (12/20/25)
-#   - Output formatting / Output modes (quiet - DONE (12/30/25), grepable, JSON, full packet - DONE (12/30/25)) 
-#   - Make all args optional
+#   - Output formatting / Output modes (quiet - DONE (12/30/25), grepable - DONE (12/31/2025), JSON  - DONE (12/31/2025), CSV  - DONE (12/31/2025), full packet - DONE (12/30/25)) 
+#   - Make all args optional - DONE (12/31/2025)
 #   - Expand port arg to scan common groups of ports (all, common, etc)
 #   - Better arg help message (add usage)
 #   - Batching - DONE (12/30/25)
@@ -18,9 +18,10 @@
 #   - Use Scapy for SYN mode and full packet output - DONE (12/30/25)
 #   - Threading for banners?
 #
-# Example Usage Goal: sudo python3 port_scanner.py -t scanme.nmap.org -p 1-1024 -v 2 -b 200
+# Example Usage Goal: sudo python3 port_scanner.py -t scanme.nmap.org -p 1-1024 -v 2 -b 200 -o grep
 #
 # Issues: 
+import os
 
 from scapy.all import IP, TCP, sr, sr1, hexdump
 
@@ -32,11 +33,24 @@ import sys
 # Imports system-specific functions.
 # We use this mainly for sys.exit() to cleanly terminate the program.
 
+import json
+import csv
+
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("-t", "--target", help="target ip or hostname to be scanned", required=True)
-parser.add_argument("-p", "--ports", help="port(s) to be scanned on target", required=True)
+parser.add_argument(
+    "-t", "--target", 
+    default="scanme.nmap.org", 
+    help="target ip or hostname to be scanned", 
+    required=False
+)
+parser.add_argument(
+    "-p", "--ports", 
+    default="1-1024", 
+    help="port(s) to be scanned on target", 
+    required=False
+)
 parser.add_argument(
     "-v", "--verbose", 
     type=int, 
@@ -51,11 +65,21 @@ parser.add_argument(
     help="batch size for port scans", 
     required=False
 )
+parser.add_argument(
+    "-o", "--output",
+    choices=["human", "grep", "json", "csv"],
+#    type=int, 
+    default="human", 
+    help="output format: human|grep|json|csv", 
+    required=False
+)
 cli = vars(parser.parse_args())
 
+output_buffer = []
+
 def vprint(level, *args, **kwargs):
-        if cli["verbose"] >= level:
-            print(*args, **kwargs)
+    if cli["output"] == "human" and cli["verbose"] >= level:
+        print(*args, **kwargs)
 
 def parse_ports(port_arg):
     try:
@@ -91,15 +115,26 @@ def scan_ports_batched(ip, ports, batch_size):
         vprint(2, f"[*] Scanning ports {batch[0]}-{batch[-1]}")
 
         packets = IP(dst=ip) / TCP(dport=batch, flags="S")
-        answered, unanswered = sr(packets, timeout=1, verbose=False)
+        try:
+            answered, unanswered = sr(packets, timeout=1, verbose=False)
+        except PermissionError:
+            print("[!] Raw socket permission denied (run as root).")
+            sys.exit(1)
+        except Exception as e:
+            vprint(2, f"[!] Packet send error: {e}")
+            return results
 
         # Handle answered packets
         for sent, recv in answered:
+            if not sent.haslayer(TCP):
+                continue
+            
             port = sent[TCP].dport
 
             if recv.haslayer(ICMP):
                 icmp = recv[ICMP]
-                if icmp.type == 3:
+                if icmp.type == 3 and icmp.code in {1,2,3,9,10,13}:
+                    # administratively prohibited / unreachable
                     results[port] = ("filtered", recv)
                     continue
 
@@ -151,25 +186,82 @@ def resolve_target(target):
         vprint(2, f"[!] Unable to resolve target: {target}")
         sys.exit(2)
 
+def emit_result(target, port, state, banner=None):
+    fmt = cli["output"]
+    
+    record = {
+        "target": target,
+        "port": port,
+        "protocol": "tcp",
+        "state": state,
+        "banner": banner or ""
+    }
+
+    if fmt == "human":
+        if state == "open":
+            vprint(0, f"[+] Port {port} open")
+            if banner:
+                vprint(1, f"    Banner: {banner}")
+
+    elif fmt == "grep":
+        # one line, script-friendly
+        if state == "open":
+            line = f"{target} {port}/tcp {state}"
+            if banner:
+                line += f" {banner}"
+            vprint(0, line)
+
+    elif fmt in ("json", "csv"):
+        output_buffer.append(record)
+
+if cli["batch"] < 1:
+    vprint(1, "[!] Batch size must be >= 1")
+    sys.exit(2)
+    
+def emit_structured_output():
+    fmt = cli["output"]
+
+    if fmt == "json":
+        print(json.dumps(output_buffer, indent=2))
+
+    elif fmt == "csv":
+        writer = csv.DictWriter(
+            sys.stdout,
+            fieldnames=["target", "port", "protocol", "state", "banner"]
+        )
+        writer.writeheader()
+        for row in output_buffer:
+            writer.writerow(row)
+
 def main():
+    if os.geteuid() != 0:
+        vprint(1, "[!] Root privileges required (run with sudo).")
+        sys.exit(1)
+    
     try: 
         ip = resolve_target(cli["target"])
         
         ports = parse_ports(cli["ports"])
+        
+        vprint(1, f"[*] Scanning {cli['target']} ({ip})")
     
         results = scan_ports_batched(ip, ports, cli["batch"])
 
-        for port in sorted(results):
+        for port in sorted(p for p, (s, _) in results.items() if s == "open"):
             state, packet = results[port]
 
-            if state == "open":
-                vprint(0, f"[+] Port {port} open")
+            banner = banner_grab(ip, port)
 
-                banner = banner_grab(ip, port)
-                if banner:
-                    vprint(1, f"    Banner: {banner}")
+            emit_result(cli["target"], port, state, banner)
+            print_packet(packet)
+              
+        emit_structured_output()
+        
+        open_ports = [p for p, (s, _) in results.items() if s == "open"]
+        vprint(1, f"[*] {len(open_ports)} open ports found")        
 
-                print_packet(packet)
+        vprint(1, "[*] Scan complete")
+        # Indicates the scan finished successfully.
 
     except KeyboardInterrupt:
         # Catches Ctrl+C so the program exits cleanly.
@@ -180,9 +272,6 @@ def main():
     except Exception as e:
         vprint(2, f"[!] Fatal error: {e}")
         sys.exit(1)
-
-    vprint(1, "[*] Scan complete.")
-    # Indicates the scan finished successfully.
 
 if __name__ == "__main__":
     # ensures main() only runs when the script is executed directly.
