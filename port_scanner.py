@@ -9,17 +9,16 @@
 #   - Add port ranges - DONE (12/20/25)
 #   - Output formatting / Output modes (quiet - DONE (12/30/25), grepable - DONE (12/31/2025), JSON  - DONE (12/31/2025), CSV  - DONE (12/31/2025), full packet - DONE (12/30/25)) 
 #   - Make all args optional - DONE (12/31/2025)
-#   - Expand port arg to scan common groups of ports (all, common, etc)
 #   - Better arg help message (add usage) - DONE (12/31/2025)
 #   - Batching - DONE (12/30/25)
 #   - Use socket for banners with scapy - DONE (12/30/25)
 #   - ICMP filtered handling - DONE (12/30/25)
-#   - CIDR expansion - DONE (12/31/2025) / progress reporting
+#   - CIDR expansion - DONE (12/31/2025) / progress reporting - DONE (12/31/2025)
 #   - Use Scapy for SYN mode and full packet output - DONE (12/30/25)
 #   - Threading for banners - DONE (12/31/2025)
-#   - Batch randomization for stealth
+#   - Batch randomization for stealth - DONE (12/31/2025)
 #
-# Example Usage Goal: sudo python3 port_scanner.py -t scanme.nmap.org -p 1-1024 -v 2 -b 200 -o grep
+# Example Usage Goal: sudo python3 port_scanner.py -t scanme.nmap.org -p 1-1024 -v 2 -b 200 -o grep -r
 #
 # Issues: 
 
@@ -35,19 +34,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import ipaddress
 import signal
 import time
+import random
 
 start_time = time.time()
 
 stop_scan = False
 
+progress_active = False
+
 MAX_BANNER_THREADS = 10
 
 parser = argparse.ArgumentParser(
-    description="TCP SYN port scanner (educational use)",
+    description=(
+        "TCP SYN port scanner using Scapy (educational use).\n"
+        "Supports CIDR expansion, batching, randomization, banner grabbing,\n"
+        "and multiple output formats."
+    ),
     epilog=(
         "Examples:\n"
         "  sudo python3 port_scanner.py -t scanme.nmap.org\n"
         "  sudo python3 port_scanner.py -t 192.168.1.1 -p 22,80,443\n"
+        "  sudo python3 port_scanner.py -t 192.168.1.0/24 -p 22 -r\n"
         "  sudo python3 port_scanner.py -t example.com -p 1-1024 -o json\n"
         "  sudo python3 port_scanner.py -t localhost -p 80 -v 4\n"
     ),
@@ -59,7 +66,11 @@ parser.add_argument(
     default="scanme.nmap.org",
     metavar="HOST",
     help=(
-        "Target host to scan (IP address or hostname).\n"
+        "Target to scan.\n"
+        "Accepted formats:\n"
+        "  - Hostname (example.com)\n"
+        "  - Single IP (192.168.1.10)\n"
+        "  - CIDR range (192.168.1.0/24)\n"
         "Default: scanme.nmap.org"
     )
 )
@@ -69,8 +80,8 @@ parser.add_argument(
     default="1-1024",
     metavar="PORTS",
     help=(
-        "Port(s) to scan.\n"
-        "Formats:\n"
+        "Ports to scan.\n"
+        "Supported formats:\n"
         "  80\n"
         "  22,80,443\n"
         "  1-1024\n"
@@ -88,9 +99,9 @@ parser.add_argument(
     help=(
         "Verbosity level:\n"
         "  0 = quiet (open ports only)\n"
-        "  1 = normal output (default)\n"
-        "  2 = debug / scan progress\n"
-        "  4 = full packet dump"
+        "  1 = standard output (default)\n"
+        "  2 = detailed progress and debug info\n"
+        "  4 = full packet summaries and hex dumps"
     )
 )
 
@@ -100,8 +111,9 @@ parser.add_argument(
     default=50,
     metavar="N",
     help=(
-        "Number of ports to scan per batch.\n"
-        "Lower values are slower but stealthier.\n"
+        "Number of ports scanned per batch.\n"
+        "Smaller values are slower but stealthier.\n"
+        "Larger values are faster but noisier.\n"
         "Default: 50"
     )
 )
@@ -113,12 +125,22 @@ parser.add_argument(
     metavar="FORMAT",
     help=(
         "Output format:\n"
-        "  human = human-readable output (default)\n"
-        "  grep  = single-line, script-friendly output\n"
-        "  json  = structured JSON\n"
-        "  csv   = CSV for spreadsheets or parsing"
+        "  human = readable console output (default)\n"
+        "  grep  = one-line-per-result (script friendly)\n"
+        "  json  = structured JSON output\n"
+        "  csv   = CSV output for spreadsheets or tooling"
     )
 )
+
+parser.add_argument(
+    "-r", "--randomize",
+    action="store_true",
+    help=(
+        "Randomize host and port order.\n"
+        "Reduces scan patterns and increases stealth."
+    )
+)
+
 
 cli = vars(parser.parse_args())
 
@@ -127,8 +149,7 @@ output_buffer = []
 def handle_sigint(signum, frame):
     global stop_scan
     stop_scan = True
-    if not stop_scan:
-        print("\n[!] Interrupt received, stopping...")
+    progress_finish()
 
 signal.signal(signal.SIGINT, handle_sigint)
 
@@ -174,10 +195,13 @@ def scan_ports_batched(ip, ports, batch_size, total_work, completed_work):
     results = {}
 
     ports = list(ports)
+    
+    if cli.get("randomize"):
+        random.shuffle(ports)
 
     for i in range(0, len(ports), batch_size):
         if stop_scan:
-            return results
+            return results, completed_work
     
         batch = ports[i:i + batch_size]
 
@@ -190,7 +214,10 @@ def scan_ports_batched(ip, ports, batch_size, total_work, completed_work):
             sys.exit(1)
         except Exception as e:
             vprint(2, f"[!] Packet send error: {e}")
-            return results
+            return results, completed_work
+        
+        if cli.get("randomize"):
+            time.sleep(random.uniform(0.02, 0.15))
         
         completed_work += len(batch)
         progress_update(
@@ -319,33 +346,46 @@ def emit_structured_output():
     fmt = cli["output"]
 
     if fmt == "json":
-        print(json.dumps(output_buffer, indent=2))
+        # Pretty-printed JSON with no extra spaces
+        print(json.dumps(output_buffer, indent=2, separators=(',', ': ')))
 
     elif fmt == "csv":
+        # Ensure no extra blank lines in CSV
         writer = csv.DictWriter(
             sys.stdout,
-            fieldnames=["target", "port", "protocol", "state", "banner"]
+            fieldnames=["target", "port", "protocol", "state", "banner"],
+            lineterminator="\n"  # important: prevents extra blank lines
         )
         writer.writeheader()
         for row in output_buffer:
+            # Strip whitespace from banner to remove accidental spaces
+            row["banner"] = row["banner"].strip()
             writer.writerow(row)
 
 def progress_update(done, total, prefix=""):
-    if cli["output"] != "human" or cli["verbose"] < 2:
-        return
+    global progress_active
 
     percent = (done / total) * 100
     elapsed = time.time() - start_time
     rate = done / elapsed if elapsed > 0 else 0
     eta = (total - done) / rate if rate > 0 else 0
 
-    sys.stdout.write(
+    progress_active = True
+
+    sys.stderr.write(
         f"\r{prefix}{done}/{total} "
         f"({percent:5.1f}%) | "
         f"{rate:6.1f} ops/sec | "
         f"ETA {eta:5.1f}s"
     )
-    sys.stdout.flush()
+    sys.stderr.flush()
+
+def progress_finish():
+    global progress_active
+    if progress_active:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        progress_active = False
     
 def main():
     if os.geteuid() != 0:
@@ -358,6 +398,10 @@ def main():
     
     try: 
         targets = expand_target(cli["target"])
+        
+        if cli["randomize"]:
+            random.shuffle(targets)
+            
         ports = parse_ports(cli["ports"])
         
         total_hosts = len(targets)
@@ -390,7 +434,8 @@ def main():
             open_ports = sorted(p for p, (s, _) in results.items() if s == "open")
 
             if cli["verbose"] >= 2:
-                print() # finalize progress line cleanly
+                
+                progress_finish()
                 
                 with ThreadPoolExecutor(max_workers=MAX_BANNER_THREADS) as executor:
                     if stop_scan:
@@ -414,8 +459,7 @@ def main():
                     state, _ = results[port]
                     emit_result(ip, port, state, None)
                     
-            #if cli["verbose"] >= 2:
-            #    print()
+        progress_finish()
 
         emit_structured_output()
     
@@ -423,13 +467,8 @@ def main():
         vprint(2, f"[!] Fatal error: {e}")
         sys.exit(1)
         
-    if stop_scan:
-        vprint(1, "\n[*] Scan aborted by user")
-    else:
-        vprint(1, "[*] Scan complete")
-
-        # Indicates the scan finished successfully.
-
+    if not stop_scan:
+        vprint(1, "[*] Scan complete") # Indicates the scan finished successfully.
 
 if __name__ == "__main__":
     # ensures main() only runs when the script is executed directly.
