@@ -10,111 +10,179 @@
 #   - Output formatting / Output modes (quiet - DONE (12/30/25), grepable - DONE (12/31/2025), JSON  - DONE (12/31/2025), CSV  - DONE (12/31/2025), full packet - DONE (12/30/25)) 
 #   - Make all args optional - DONE (12/31/2025)
 #   - Expand port arg to scan common groups of ports (all, common, etc)
-#   - Better arg help message (add usage)
+#   - Better arg help message (add usage) - DONE (12/31/2025)
 #   - Batching - DONE (12/30/25)
 #   - Use socket for banners with scapy - DONE (12/30/25)
 #   - ICMP filtered handling - DONE (12/30/25)
-#   - CIDR expansion / progress reporting
+#   - CIDR expansion - DONE (12/31/2025) / progress reporting
 #   - Use Scapy for SYN mode and full packet output - DONE (12/30/25)
-#   - Threading for banners?
+#   - Threading for banners - DONE (12/31/2025)
+#   - Batch randomization for stealth
 #
 # Example Usage Goal: sudo python3 port_scanner.py -t scanme.nmap.org -p 1-1024 -v 2 -b 200 -o grep
 #
 # Issues: 
+
 import os
-
 from scapy.all import IP, TCP, sr, sr1, hexdump
-
 from scapy.layers.inet import ICMP
-
 import socket
-
 import sys
-# Imports system-specific functions.
-# We use this mainly for sys.exit() to cleanly terminate the program.
-
 import json
 import csv
-
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import ipaddress
+import signal
+import time
 
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    "-t", "--target", 
-    default="scanme.nmap.org", 
-    help="target ip or hostname to be scanned", 
-    required=False
+start_time = time.time()
+
+stop_scan = False
+
+MAX_BANNER_THREADS = 10
+
+parser = argparse.ArgumentParser(
+    description="TCP SYN port scanner (educational use)",
+    epilog=(
+        "Examples:\n"
+        "  sudo python3 port_scanner.py -t scanme.nmap.org\n"
+        "  sudo python3 port_scanner.py -t 192.168.1.1 -p 22,80,443\n"
+        "  sudo python3 port_scanner.py -t example.com -p 1-1024 -o json\n"
+        "  sudo python3 port_scanner.py -t localhost -p 80 -v 4\n"
+    ),
+    formatter_class=argparse.RawDescriptionHelpFormatter
 )
+
 parser.add_argument(
-    "-p", "--ports", 
-    default="1-1024", 
-    help="port(s) to be scanned on target", 
-    required=False
+    "-t", "--target",
+    default="scanme.nmap.org",
+    metavar="HOST",
+    help=(
+        "Target host to scan (IP address or hostname).\n"
+        "Default: scanme.nmap.org"
+    )
 )
+
 parser.add_argument(
-    "-v", "--verbose", 
-    type=int, 
-    default=1, 
-    help="Verbosity level: 0=quiet, 1=normal, 2=more info 4=full packet", 
-    required=False
+    "-p", "--ports",
+    default="1-1024",
+    metavar="PORTS",
+    help=(
+        "Port(s) to scan.\n"
+        "Formats:\n"
+        "  80\n"
+        "  22,80,443\n"
+        "  1-1024\n"
+        "  1-1024,3306,8080\n"
+        "Default: 1-1024"
+    )
 )
+
 parser.add_argument(
-    "-b", "--batch", 
-    type=int, 
-    default=100, 
-    help="batch size for port scans", 
-    required=False
+    "-v", "--verbose",
+    type=int,
+    default=1,
+    choices=[0, 1, 2, 4],
+    metavar="LEVEL",
+    help=(
+        "Verbosity level:\n"
+        "  0 = quiet (open ports only)\n"
+        "  1 = normal output (default)\n"
+        "  2 = debug / scan progress\n"
+        "  4 = full packet dump"
+    )
 )
+
+parser.add_argument(
+    "-b", "--batch",
+    type=int,
+    default=50,
+    metavar="N",
+    help=(
+        "Number of ports to scan per batch.\n"
+        "Lower values are slower but stealthier.\n"
+        "Default: 50"
+    )
+)
+
 parser.add_argument(
     "-o", "--output",
     choices=["human", "grep", "json", "csv"],
-#    type=int, 
-    default="human", 
-    help="output format: human|grep|json|csv", 
-    required=False
+    default="human",
+    metavar="FORMAT",
+    help=(
+        "Output format:\n"
+        "  human = human-readable output (default)\n"
+        "  grep  = single-line, script-friendly output\n"
+        "  json  = structured JSON\n"
+        "  csv   = CSV for spreadsheets or parsing"
+    )
 )
+
 cli = vars(parser.parse_args())
 
 output_buffer = []
+
+def handle_sigint(signum, frame):
+    global stop_scan
+    stop_scan = True
+    if not stop_scan:
+        print("\n[!] Interrupt received, stopping...")
+
+signal.signal(signal.SIGINT, handle_sigint)
 
 def vprint(level, *args, **kwargs):
     if cli["output"] == "human" and cli["verbose"] >= level:
         print(*args, **kwargs)
 
 def parse_ports(port_arg):
+    ports = set()
+
     try:
-        if "-" in port_arg:
-            start, end = port_arg.split("-", 1)
-            start, end = int(start), int(end)
-        
-            if not (1 <= start <= 65535 and 1 <= end <= 65535):
-                raise ValueError
-                
-            if start > end:
-                raise ValueError("Start port greater then end port")
-            
-            return range(start, end + 1)
-        else:
-            port = int(port_arg)
-            if not (1 <= port <= 65535):
-                raise ValueError
-            return [port]
-    
+        for part in port_arg.split(","):
+            part = part.strip()
+
+            if "-" in part:
+                start, end = part.split("-", 1)
+                start, end = int(start), int(end)
+
+                if not (1 <= start <= 65535 and 1 <= end <= 65535):
+                    raise ValueError
+
+                if start > end:
+                    raise ValueError("Start port greater than end port")
+
+                ports.update(range(start, end + 1))
+
+            else:
+                port = int(part)
+                if not (1 <= port <= 65535):
+                    raise ValueError
+                ports.add(port)
+
+        if not ports:
+            raise ValueError
+
+        return sorted(ports)
+
     except ValueError:
-        vprint(2,"[!] Invalid port specification.")
+        vprint(2, "[!] Invalid port specification.")
         sys.exit(2)
     
-def scan_ports_batched(ip, ports, batch_size):
+def scan_ports_batched(ip, ports, batch_size, total_work, completed_work):
     results = {}
 
     ports = list(ports)
 
     for i in range(0, len(ports), batch_size):
+        if stop_scan:
+            return results
+    
         batch = ports[i:i + batch_size]
 
-        vprint(2, f"[*] Scanning ports {batch[0]}-{batch[-1]}")
-
         packets = IP(dst=ip) / TCP(dport=batch, flags="S")
+        
         try:
             answered, unanswered = sr(packets, timeout=1, verbose=False)
         except PermissionError:
@@ -123,7 +191,14 @@ def scan_ports_batched(ip, ports, batch_size):
         except Exception as e:
             vprint(2, f"[!] Packet send error: {e}")
             return results
-
+        
+        completed_work += len(batch)
+        progress_update(
+            completed_work,
+            total_work,
+            prefix=f"[{ip}] "
+        )
+        
         # Handle answered packets
         for sent, recv in answered:
             if not sent.haslayer(TCP):
@@ -161,7 +236,7 @@ def scan_ports_batched(ip, ports, batch_size):
             port = pkt[TCP].dport
             results[port] = ("filtered", None)
 
-    return results
+    return results, completed_work
 
 def print_packet(packet):
     if cli["verbose"] >= 4 and packet:
@@ -186,6 +261,32 @@ def resolve_target(target):
         vprint(2, f"[!] Unable to resolve target: {target}")
         sys.exit(2)
 
+def expand_target(target):
+    """
+    Returns a list of IP strings.
+    Supports:
+      - hostname
+      - single IP
+      - CIDR (e.g. 192.168.1.0/24)
+    """
+    try:
+        # CIDR case
+        if "/" in target:
+            net = ipaddress.ip_network(target, strict=False)
+
+            # Skip network + broadcast for IPv4
+            if net.version == 4:
+                return [str(ip) for ip in net.hosts()]
+            else:
+                return [str(ip) for ip in net]
+
+        # Single IP or hostname
+        return [resolve_target(target)]
+
+    except ValueError:
+        vprint(2, f"[!] Invalid target: {target}")
+        sys.exit(2)
+
 def emit_result(target, port, state, banner=None):
     fmt = cli["output"]
     
@@ -201,22 +302,18 @@ def emit_result(target, port, state, banner=None):
         if state == "open":
             vprint(0, f"[+] Port {port} open")
             if banner:
-                vprint(1, f"    Banner: {banner}")
+                vprint(2, f"    Banner: {banner}")
 
     elif fmt == "grep":
-        # one line, script-friendly
         if state == "open":
             line = f"{target} {port}/tcp {state}"
             if banner:
                 line += f" {banner}"
-            vprint(0, line)
+            print(line)
+
 
     elif fmt in ("json", "csv"):
         output_buffer.append(record)
-
-if cli["batch"] < 1:
-    vprint(1, "[!] Batch size must be >= 1")
-    sys.exit(2)
     
 def emit_structured_output():
     fmt = cli["output"]
@@ -233,45 +330,106 @@ def emit_structured_output():
         for row in output_buffer:
             writer.writerow(row)
 
+def progress_update(done, total, prefix=""):
+    if cli["output"] != "human" or cli["verbose"] < 2:
+        return
+
+    percent = (done / total) * 100
+    elapsed = time.time() - start_time
+    rate = done / elapsed if elapsed > 0 else 0
+    eta = (total - done) / rate if rate > 0 else 0
+
+    sys.stdout.write(
+        f"\r{prefix}{done}/{total} "
+        f"({percent:5.1f}%) | "
+        f"{rate:6.1f} ops/sec | "
+        f"ETA {eta:5.1f}s"
+    )
+    sys.stdout.flush()
+    
 def main():
     if os.geteuid() != 0:
         vprint(1, "[!] Root privileges required (run with sudo).")
         sys.exit(1)
     
+    if cli["batch"] < 1:
+        vprint(1, "[!] Batch size must be >= 1")
+        sys.exit(2)
+    
     try: 
-        ip = resolve_target(cli["target"])
-        
+        targets = expand_target(cli["target"])
         ports = parse_ports(cli["ports"])
         
-        vprint(1, f"[*] Scanning {cli['target']} ({ip})")
-    
-        results = scan_ports_batched(ip, ports, cli["batch"])
+        total_hosts = len(targets)
+        total_ports = len(ports)
+        total_work = total_hosts * total_ports
+        completed_work = 0
 
-        for port in sorted(p for p, (s, _) in results.items() if s == "open"):
-            state, packet = results[port]
+        host_count = 0
 
-            banner = banner_grab(ip, port)
+        for ip in targets:
+            if stop_scan:
+                vprint(1, "[*] Scan aborted by user")
+                break
+            
+            host_count += 1
 
-            emit_result(cli["target"], port, state, banner)
-            print_packet(packet)
-              
+            vprint(
+                1,
+                f"[*] Scanning {ip} ({host_count}/{total_hosts})"
+            )
+
+            results, completed_work = scan_ports_batched(
+                ip,
+                ports,
+                cli["batch"],
+                total_work,
+                completed_work
+            )
+            
+            open_ports = sorted(p for p, (s, _) in results.items() if s == "open")
+
+            if cli["verbose"] >= 2:
+                print() # finalize progress line cleanly
+                
+                with ThreadPoolExecutor(max_workers=MAX_BANNER_THREADS) as executor:
+                    if stop_scan:
+                        break
+
+                    futures = {
+                        executor.submit(banner_grab, ip, port): port
+                        for port in open_ports
+                    }
+
+                    for future in as_completed(futures):
+                        port = futures[future]
+                        banner = future.result()
+                        state, packet = results[port]
+
+                        emit_result(ip, port, state, banner)
+                        print_packet(packet)
+                
+            else:
+                for port in open_ports:
+                    state, _ = results[port]
+                    emit_result(ip, port, state, None)
+                    
+            #if cli["verbose"] >= 2:
+            #    print()
+
         emit_structured_output()
-        
-        open_ports = [p for p, (s, _) in results.items() if s == "open"]
-        vprint(1, f"[*] {len(open_ports)} open ports found")        
-
-        vprint(1, "[*] Scan complete")
-        # Indicates the scan finished successfully.
-
-    except KeyboardInterrupt:
-        # Catches Ctrl+C so the program exits cleanly.
-        vprint(2, "\n[!] Scan interrupted by user. Exiting.")
-        sys.exit(0)
-        # Exits normally (exit code 0)
     
     except Exception as e:
         vprint(2, f"[!] Fatal error: {e}")
         sys.exit(1)
+        
+    if stop_scan:
+        vprint(1, "\n[*] Scan aborted by user")
+    else:
+        vprint(1, "[*] Scan complete")
+
+        # Indicates the scan finished successfully.
+
 
 if __name__ == "__main__":
     # ensures main() only runs when the script is executed directly.
